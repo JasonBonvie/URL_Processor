@@ -1,0 +1,29 @@
+[project]
+name = "automated_sequential_batch_sustainability_classifier"
+version = "0.1.0"
+description = "automated_sequential_batch_sustainability_classifier using crewAI"
+authors = [{ name = "Your Name", email = "you@example.com" }]
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "crewai[litellm,tools,anthropic]==1.9.3",
+    "pandas>=2.0.0",
+    "openpyxl>=3.1.0",
+    "firecrawl-py>=4.18.0",
+]
+
+[project.scripts]
+automated_sequential_batch_sustainability_classifier = "automated_sequential_batch_sustainability_classifier.main:run"
+run_crew = "automated_sequential_batch_sustainability_classifier.main:run"
+run_batch = "automated_sequential_batch_sustainability_classifier.main:run_batch"
+run_interactive = "automated_sequential_batch_sustainability_classifier.main:run_batch_interactive"
+train = "automated_sequential_batch_sustainability_classifier.main:train"
+replay = "automated_sequential_batch_sustainability_classifier.main:replay"
+test = "automated_sequential_batch_sustainability_classifier.main:test"
+run_with_trigger = "automated_sequential_batch_sustainability_classifier.main:run_with_trigger"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.crewai]
+type = "crew"
