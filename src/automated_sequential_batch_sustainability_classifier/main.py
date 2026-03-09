@@ -1,312 +1,128 @@
 #!/usr/bin/env python
 """
-Main entry point for the Sustainability Classifier.
+Sustainability Marketing Classifier - Entry Point
 
-Uses CrewAI Flows for batch processing of large Excel files.
+Run with: crewai run
+
+Inputs are provided via environment variables:
+  GOOGLE_DRIVE_URL  - Google Drive spreadsheet URL (required)
+  URL_COLUMN        - Column name containing URLs (required)
+  OUTPUT_FILENAME   - Output CSV filename (optional)
+  BATCH_SIZE        - URLs per batch (optional, default: 5)
 """
 
-import sys
 import os
+import sys
+import logging
+import warnings
+
+# =============================================================================
+# Suppress ALL CrewAI noise BEFORE any crewai imports
+# =============================================================================
+
+# Disable telemetry
+os.environ["CREWAI_TELEMETRY_ENABLED"] = "false"
+os.environ["OTEL_SDK_DISABLED"] = "true"
+
+# Suppress warnings
+warnings.filterwarnings("ignore", message=".*Event pairing mismatch.*")
+warnings.filterwarnings("ignore", message=".*CrewAIEventsBus.*")
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", module="crewai.*")
+
+# Suppress noisy loggers before they initialize
+for logger_name in [
+    "crewai", "crewai.telemetry", "crewai.utilities", "crewai.flow",
+    "litellm", "anthropic", "httpx", "opentelemetry", "urllib3"
+]:
+    logging.getLogger(logger_name).setLevel(logging.CRITICAL)
 
 
-def run():
+class _SuppressCrewAINoise(logging.Filter):
+    """Filter out CrewAI event bus warnings and API usage spam."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        suppress = [
+            "Event pairing mismatch", "CrewAIEventsBus", "API usage",
+            "input_tokens", "output_tokens", "total_tokens", "Anthropic API"
+        ]
+        return not any(s in msg for s in suppress)
+
+
+# Patch stdout/stderr to filter [CrewAIEventsBus] messages
+class _FilteredStream:
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text):
+        if "[CrewAIEventsBus]" not in text and "API usage" not in text:
+            self._stream.write(text)
+
+    def flush(self):
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+sys.stdout = _FilteredStream(sys.__stdout__)
+sys.stderr = _FilteredStream(sys.__stderr__)
+
+from automated_sequential_batch_sustainability_classifier.batch_flow import (
+    run_batch_flow,
+)
+
+# Configure logging with filter
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logging.getLogger().addFilter(_SuppressCrewAINoise())
+logger = logging.getLogger(__name__)
+
+
+def run() -> None:
     """
-    Run the batch processing flow.
+    Run the sustainability classification flow.
 
-    This is the default entry point for `crewai run`.
+    Inputs from environment variables:
+        GOOGLE_DRIVE_URL: Google Drive spreadsheet URL
+        URL_COLUMN: Column name containing URLs
+        OUTPUT_FILENAME: Output CSV filename (optional)
+        BATCH_SIZE: URLs per batch (optional)
     """
-    from automated_sequential_batch_sustainability_classifier.batch_flow import run_batch_flow, is_google_drive_reference
+    google_drive_url = os.environ.get("GOOGLE_DRIVE_URL")
+    url_column = os.environ.get("URL_COLUMN")
+    output_filename = os.environ.get("OUTPUT_FILENAME")
+    batch_size = int(os.environ.get("BATCH_SIZE", "5"))
 
-    # Default configuration - can be local path OR Google Drive file ID/URL
-    file_path = "Classifier Test File 1-2.xlsx"
-    output_filename = None
-    batch_size = 5
+    if not google_drive_url:
+        raise ValueError("GOOGLE_DRIVE_URL environment variable is required")
+    if not url_column:
+        raise ValueError("URL_COLUMN environment variable is required")
 
-    # Check for environment variable override
-    if os.environ.get('CLASSIFIER_FILE_URL'):
-        file_path = os.environ.get('CLASSIFIER_FILE_URL')
-    elif os.environ.get('GOOGLE_DRIVE_FILE_ID'):
-        file_path = os.environ.get('GOOGLE_DRIVE_FILE_ID')
-
-    is_remote = is_google_drive_reference(file_path)
-
-    print(f"""
-╔══════════════════════════════════════════════════════════════╗
-║     Sustainability Classifier - Batch Processing Flow        ║
-╚══════════════════════════════════════════════════════════════╝
-
-Configuration:
-- Input: {file_path[:60] + '...' if len(file_path) > 60 else file_path}
-- Source: {'Google Drive (Enterprise Integration)' if is_remote else 'Local file'}
-- Output file: {output_filename or 'auto-generated'}
-- Batch size: {batch_size}
-""")
+    logger.info("Starting sustainability classification flow")
+    logger.info(f"Google Drive URL: {google_drive_url[:60]}...")
+    logger.info(f"URL Column: {url_column}")
+    logger.info(f"Batch Size: {batch_size}")
 
     result = run_batch_flow(
-        file_path=file_path,
+        google_drive_url=google_drive_url,
+        url_column=url_column,
         output_filename=output_filename,
         batch_size=batch_size,
     )
 
     if result.is_complete:
-        print("\n✓ Batch processing completed successfully!")
-        print(f"  Processed: {result.processed_count} URLs")
-        print(f"  Failed: {len(result.failed_urls)} URLs")
+        logger.info(f"Complete: {result.processed_count}/{result.total_urls} URLs processed")
+        if result.output_filename:
+            logger.info(f"Results uploaded to Google Sheet: {result.output_filename}")
+        if result.failed_urls:
+            logger.warning(f"Failed: {len(result.failed_urls)} URLs")
     else:
-        print(f"\n✗ Batch processing completed with errors: {result.error_message}")
-
-
-def run_batch():
-    """
-    Run batch processing flow with command line arguments.
-
-    Usage: run_batch [file_path] [output_filename] [batch_size]
-    """
-    from automated_sequential_batch_sustainability_classifier.batch_flow import run_batch_flow, is_google_drive_reference
-
-    # Default values - supports local path OR Google Drive file ID/URL
-    file_path = "Classifier Test File 1-2.xlsx"
-    output_filename = None
-    batch_size = 5
-
-    # Parse command line arguments (skip script name and command)
-    args = sys.argv[2:] if len(sys.argv) > 2 else []
-
-    if len(args) > 0:
-        file_path = args[0]
-    if len(args) > 1:
-        output_filename = args[1]
-    if len(args) > 2:
-        batch_size = int(args[2])
-
-    is_remote = is_google_drive_reference(file_path)
-
-    print(f"""
-╔══════════════════════════════════════════════════════════════╗
-║     Sustainability Classifier - Batch Processing Flow        ║
-╚══════════════════════════════════════════════════════════════╝
-
-Configuration:
-- Input: {file_path[:60] + '...' if len(file_path) > 60 else file_path}
-- Source: {'Google Drive (Enterprise Integration)' if is_remote else 'Local file'}
-- Output file: {output_filename or 'auto-generated'}
-- Batch size: {batch_size}
-""")
-
-    result = run_batch_flow(
-        file_path=file_path,
-        output_filename=output_filename,
-        batch_size=batch_size,
-    )
-
-    if result.is_complete:
-        print("\n✓ Batch processing completed successfully!")
-        print(f"  Processed: {result.processed_count} URLs")
-        print(f"  Failed: {len(result.failed_urls)} URLs")
-    else:
-        print(f"\n✗ Batch processing completed with errors: {result.error_message}")
-
-
-def run_batch_interactive():
-    """
-    Run batch processing with interactive prompts for configuration.
-    """
-    from automated_sequential_batch_sustainability_classifier.batch_flow import run_batch_flow
-
-    print("""
-╔══════════════════════════════════════════════════════════════╗
-║   Sustainability Classifier - Interactive Batch Processing   ║
-╚══════════════════════════════════════════════════════════════╝
-""")
-
-    # Get file path
-    default_file = "Classifier Test File 1-2.xlsx"
-    file_path = input(f"Enter Excel file path [{default_file}]: ").strip()
-    if not file_path:
-        file_path = default_file
-
-    # Check if file exists
-    if not os.path.exists(file_path):
-        print(f"Warning: File '{file_path}' not found in current directory.")
-        proceed = input("Continue anyway? (y/n): ").strip().lower()
-        if proceed != 'y':
-            print("Aborted.")
-            return
-
-    # Get output filename
-    output_filename = input("Enter output filename (leave blank for auto-generated): ").strip()
-    if not output_filename:
-        output_filename = None
-
-    # Get batch size
-    batch_size_str = input("Enter batch size [10]: ").strip()
-    batch_size = int(batch_size_str) if batch_size_str else 10
-
-    print(f"\nStarting batch processing with:")
-    print(f"  - Input: {file_path}")
-    print(f"  - Output: {output_filename or 'auto-generated'}")
-    print(f"  - Batch size: {batch_size}")
-    print()
-
-    result = run_batch_flow(
-        file_path=file_path,
-        output_filename=output_filename,
-        batch_size=batch_size,
-    )
-
-    if result.is_complete:
-        print("\n✓ Batch processing completed successfully!")
-        print(f"  Processed {result.processed_count} URLs")
-    else:
-        print(f"\n✗ Batch processing completed with errors: {result.error_message}")
-
-
-def run_single():
-    """
-    Run the original single-batch crew (legacy mode).
-    """
-    from automated_sequential_batch_sustainability_classifier.crew import (
-        AutomatedSequentialBatchSustainabilityClassifierCrew
-    )
-
-    inputs = {
-        'file_path': 'Classifier Test File 1-2.xlsx',
-        'batch_number': '1',
-        'output_filename': 'sustainability_results.csv'
-    }
-    AutomatedSequentialBatchSustainabilityClassifierCrew().crew().kickoff(inputs=inputs)
-
-
-def train():
-    """
-    Train the crew for a given number of iterations.
-    """
-    from automated_sequential_batch_sustainability_classifier.crew import (
-        AutomatedSequentialBatchSustainabilityClassifierCrew
-    )
-
-    inputs = {
-        'file_path': 'sample_value',
-        'batch_number': 'sample_value',
-        'output_filename': 'sample_value'
-    }
-    try:
-        AutomatedSequentialBatchSustainabilityClassifierCrew().crew().train(
-            n_iterations=int(sys.argv[2]),
-            filename=sys.argv[3],
-            inputs=inputs
-        )
-    except Exception as e:
-        raise Exception(f"An error occurred while training the crew: {e}")
-
-
-def replay():
-    """
-    Replay the crew execution from a specific task.
-    """
-    from automated_sequential_batch_sustainability_classifier.crew import (
-        AutomatedSequentialBatchSustainabilityClassifierCrew
-    )
-
-    try:
-        AutomatedSequentialBatchSustainabilityClassifierCrew().crew().replay(task_id=sys.argv[2])
-    except Exception as e:
-        raise Exception(f"An error occurred while replaying the crew: {e}")
-
-
-def test():
-    """
-    Test the crew execution and returns the results.
-    """
-    from automated_sequential_batch_sustainability_classifier.crew import (
-        AutomatedSequentialBatchSustainabilityClassifierCrew
-    )
-
-    inputs = {
-        'file_path': 'sample_value',
-        'batch_number': 'sample_value',
-        'output_filename': 'sample_value'
-    }
-    try:
-        AutomatedSequentialBatchSustainabilityClassifierCrew().crew().test(
-            n_iterations=int(sys.argv[2]),
-            openai_model_name=sys.argv[3],
-            inputs=inputs
-        )
-    except Exception as e:
-        raise Exception(f"An error occurred while testing the crew: {e}")
-
-
-def print_usage():
-    """Print usage information."""
-    print("""
-Sustainability Classifier - Usage
-==================================
-
-Commands:
-  run              Run the batch processing flow (default)
-  run_batch        Run batch processing with custom arguments
-                   Usage: run_batch [file_path_or_id] [output_filename] [batch_size]
-  run_interactive  Run batch processing with interactive prompts
-  run_single       Run the original single-batch crew (legacy)
-  train            Train the crew
-  replay           Replay crew execution from a task
-  test             Test the crew execution
-
-Input Sources (uses CrewAI Enterprise Google Drive integration):
-  - Local file:      "My Data.xlsx"
-  - Google Drive ID: "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
-  - Google Drive URL: "https://drive.google.com/file/d/FILE_ID/view"
-
-Examples:
-  # Run with defaults (processes Classifier Test File 1-2.xlsx)
-  crewai run
-
-  # Run with local file
-  python main.py run_batch "My Data.xlsx"
-
-  # Run with Google Drive file ID (Enterprise integration)
-  python main.py run_batch "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
-
-  # Run with Google Drive URL
-  python main.py run_batch "https://drive.google.com/file/d/abc123/view"
-
-  # Run with all custom options
-  python main.py run_batch "My Data.xlsx" "output.csv" 5
-
-  # Set file ID via environment variable
-  export GOOGLE_DRIVE_FILE_ID="1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
-  crewai run
-
-  # Interactive mode
-  python main.py run_interactive
-""")
+        logger.error(f"Failed: {result.error_message}")
+        raise RuntimeError(result.error_message)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        # Default to run() when no command specified
-        run()
-    else:
-        command = sys.argv[1]
-
-        if command == "run":
-            run()
-        elif command == "run_batch":
-            run_batch()
-        elif command == "run_interactive":
-            run_batch_interactive()
-        elif command == "run_single":
-            run_single()
-        elif command == "train":
-            train()
-        elif command == "replay":
-            replay()
-        elif command == "test":
-            test()
-        elif command in ["--help", "-h", "help"]:
-            print_usage()
-        else:
-            print(f"Unknown command: {command}")
-            print_usage()
-            sys.exit(1)
+    run()

@@ -1,678 +1,1007 @@
 #!/usr/bin/env python
 """
-Batch Processing Flow for Sustainability Classification
+Sustainability Marketing Classifier - Batch Processing Flow
 
-This module implements CrewAI Flows to process large Excel files in batches,
-avoiding context limits and ensuring reliable processing of all URLs.
+Processes URLs from Google Drive in parallel batches using CrewAI Flows.
 """
 
+import asyncio
+import csv
+import io
+import json
+import logging
 import os
 import re
-import json
-import tempfile
-import pandas as pd
+import sys
+import warnings
 from datetime import datetime
-from typing import Optional, List
-from pathlib import Path
+from typing import List, Optional
+
+import requests
+
+# =============================================================================
+# Suppress all CrewAI noise BEFORE importing crewai
+# =============================================================================
+
+# Suppress warnings module
+warnings.filterwarnings("ignore", message=".*Event pairing mismatch.*")
+warnings.filterwarnings("ignore", message=".*CrewAIEventsBus.*")
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# Disable CrewAI telemetry
+os.environ["CREWAI_TELEMETRY_ENABLED"] = "false"
+os.environ["OTEL_SDK_DISABLED"] = "true"
+
+# Suppress noisy loggers
+logging.getLogger("crewai").setLevel(logging.WARNING)
+logging.getLogger("crewai.telemetry").setLevel(logging.CRITICAL)
+logging.getLogger("crewai.utilities").setLevel(logging.CRITICAL)
+logging.getLogger("litellm").setLevel(logging.WARNING)
+logging.getLogger("anthropic").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("opentelemetry").setLevel(logging.CRITICAL)
+
+
+class CrewAIOutputFilter(logging.Filter):
+    """Filter out noisy CrewAI and API usage log messages."""
+
+    SUPPRESSED_PATTERNS = [
+        "Event pairing mismatch",
+        "CrewAIEventsBus",
+        "API usage",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "Anthropic API usage",
+    ]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = str(record.getMessage())
+        for pattern in self.SUPPRESSED_PATTERNS:
+            if pattern in msg:
+                return False
+        return True
+
+
+# Apply filter to root logger
+logging.getLogger().addFilter(CrewAIOutputFilter())
+
 from pydantic import BaseModel, Field
 
-from crewai import LLM
-from crewai.flow.flow import Flow, listen, start, router, or_
-from crewai import Agent, Crew, Process, Task
+from crewai import Agent, Crew, LLM, Process, Task
+from crewai.flow.flow import Flow, listen, start
 from crewai_tools import FirecrawlScrapeWebsiteTool
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-# ============================================================================
-# Output Models for Structured Classification
-# ============================================================================
+
+# =============================================================================
+# Pydantic Models
+# =============================================================================
+
 
 class URLClassification(BaseModel):
     """Classification result for a single URL."""
+
     url: str = Field(description="The URL that was analyzed")
-    sustainability_marketing: str = Field(description="YES or NO - whether sustainability is used as marketing")
-    sustainability_percentage: int = Field(default=0, description="0-100 percentage of sustainability emphasis")
+    sustainability_marketing: str = Field(description="YES or NO")
+    sustainability_percentage: int = Field(default=0, description="0-100 percentage")
     confidence: float = Field(default=0.5, description="0.0-1.0 confidence score")
-    themes: str = Field(default="", description="Comma-separated sustainability themes found")
-    reason: str = Field(description="1-2 sentences explaining WHY this classification was made, citing specific evidence from the page content")
+    themes: str = Field(default="", description="Comma-separated themes")
+    reason: str = Field(
+        description="1-2 sentences explaining the classification with specific evidence"
+    )
 
-
-class BatchClassificationResult(BaseModel):
-    """Classification results for a batch of URLs."""
-    classifications: List[URLClassification] = Field(description="List of classification results for each URL")
-
-
-# ============================================================================
-# State Models
-# ============================================================================
 
 class BatchState(BaseModel):
-    """State model for tracking batch processing progress."""
+    """State for the batch processing flow."""
 
-    # Input configuration
-    file_path: str = ""  # Can be local path or Google Drive URL
+    google_drive_url: str = ""
+    url_column: str = ""
     output_filename: str = ""
-    batch_size: int = 10
+    batch_size: int = 5
+    max_concurrent: int = 5
 
-    # Downloaded file tracking
-    temp_file_path: str = ""  # Path to downloaded temp file
-    is_remote: bool = False  # Whether file was downloaded from URL
+    all_urls: List[str] = Field(default_factory=list)
+    all_results: List[dict] = Field(default_factory=list)
+    failed_urls: List[str] = Field(default_factory=list)
 
-    # URL data
-    all_urls: list[str] = Field(default_factory=list)
     total_urls: int = 0
-
-    # Batch tracking
-    current_batch_index: int = 0
     total_batches: int = 0
-
-    # Results accumulation
-    all_results: list[dict] = Field(default_factory=list)
-    batch_results: list[dict] = Field(default_factory=list)
-
-    # Status tracking
     processed_count: int = 0
-    failed_urls: list[str] = Field(default_factory=list)
     is_complete: bool = False
     error_message: str = ""
 
 
-# ============================================================================
-# Mini Crew for Single Batch Processing
-# ============================================================================
+# =============================================================================
+# Direct Google Sheets Reader (bypasses LLM - recommended for large sheets)
+# =============================================================================
 
-class GoogleDriveReader:
-    """Uses CrewAI Enterprise Google Drive integration to read files."""
 
-    def __init__(self, llm_model: str = "anthropic/claude-sonnet-4-20250514"):
-        self.llm = LLM(model=llm_model, temperature=0.7)
+class DirectGoogleSheetsReader:
+    """
+    Reads URLs directly from Google Sheets using CSV export.
+    This bypasses the LLM entirely, avoiding truncation issues.
 
-    def _create_google_drive_agent(self) -> Agent:
-        """Create an agent with Google Drive enterprise apps."""
-        return Agent(
-            role="Google Drive File Manager",
-            goal="Download and read Excel files from Google Drive",
-            backstory="""You are a data manager who specializes in accessing files from
-            Google Drive. You can search, download, and read Excel files to extract data.""",
-            tools=[],
-            llm=self.llm,
-            allow_delegation=False,
-            max_iter=25,
-            verbose=True,
-            apps=[
-                "google_drive/find_file",
-                "google_drive/get_file_by_id",
-                "google_drive/download_file",
-                "google_drive/search_files",
-                "google_drive/list_files",
-                "google_sheets/get_spreadsheet",
-                "google_sheets/get_values",
-            ],
-        )
+    Requirements:
+    - The Google Sheet must be publicly accessible (Anyone with link can view)
+    - Or you must have proper OAuth credentials configured
+    """
 
-    def read_urls_from_drive(self, file_identifier: str) -> list[str]:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (compatible; SustainabilityClassifier/1.0)'
+        })
+
+    def read_urls(self, google_drive_url: str, url_column: str) -> List[str]:
         """
-        Read URLs from a Google Drive Excel file.
+        Extract URLs from a Google Drive spreadsheet using direct CSV export.
 
         Args:
-            file_identifier: File ID, name, or path in Google Drive
+            google_drive_url: Google Sheets URL
+            url_column: Column name containing URLs
 
         Returns:
-            List of URLs from the CLEAN_LEGACY_URL column
+            List of URLs found in the specified column
         """
-        agent = self._create_google_drive_agent()
+        spreadsheet_id = self._extract_spreadsheet_id(google_drive_url)
+
+        # Try to get gid (sheet ID) from URL, default to 0 (first sheet)
+        gid = self._extract_gid(google_drive_url)
+
+        # CSV export URL format
+        csv_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=csv&gid={gid}"
+
+        logger.info(f"Fetching spreadsheet directly via CSV export: {spreadsheet_id}")
+        logger.info(f"Looking for column: {url_column}")
+
+        try:
+            response = self.session.get(csv_url, timeout=60)
+            response.raise_for_status()
+
+            # Parse CSV content
+            content = response.content.decode('utf-8-sig')  # Handle BOM if present
+            reader = csv.DictReader(io.StringIO(content))
+
+            # Find the URL column (case-insensitive)
+            fieldnames = reader.fieldnames or []
+            url_col_name = None
+            for field in fieldnames:
+                if field.strip().upper() == url_column.upper():
+                    url_col_name = field
+                    break
+
+            if not url_col_name:
+                # Try partial match
+                for field in fieldnames:
+                    if url_column.upper() in field.upper():
+                        url_col_name = field
+                        logger.info(f"Using partial column match: '{field}' for '{url_column}'")
+                        break
+
+            if not url_col_name:
+                logger.error(f"Column '{url_column}' not found. Available columns: {fieldnames}")
+                # Fallback: look for any column containing URLs
+                logger.info("Attempting to find URLs in any column...")
+                return self._extract_urls_from_any_column(content)
+
+            urls = []
+            for row in reader:
+                cell = row.get(url_col_name, '').strip()
+                if cell.startswith('http://') or cell.startswith('https://'):
+                    urls.append(cell)
+
+            logger.info(f"Successfully extracted {len(urls)} URLs from column '{url_col_name}'")
+            return urls
+
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code in (401, 403):
+                logger.warning(f"CSV export failed ({e.response.status_code}). Sheet may not be public.")
+                logger.info("Falling back to LLM-based reader...")
+                return self._fallback_to_llm_reader(google_drive_url, url_column)
+            elif e.response.status_code == 404:
+                logger.error(f"Spreadsheet not found: {spreadsheet_id}")
+                raise ValueError(f"Spreadsheet not found: {spreadsheet_id}")
+            else:
+                logger.warning(f"CSV export failed with status {e.response.status_code}")
+                logger.info("Falling back to LLM-based reader...")
+                return self._fallback_to_llm_reader(google_drive_url, url_column)
+        except Exception as e:
+            logger.error(f"Direct CSV read failed: {e}")
+            logger.info("Falling back to LLM-based reader...")
+            return self._fallback_to_llm_reader(google_drive_url, url_column)
+
+    def _extract_spreadsheet_id(self, url: str) -> str:
+        """Extract spreadsheet ID from Google Sheets URL."""
+        if "/spreadsheets/d/" in url:
+            parts = url.split("/spreadsheets/d/")[1]
+            return parts.split("/")[0].split("?")[0]
+        return url
+
+    def _extract_gid(self, url: str) -> str:
+        """Extract sheet gid from URL, default to 0."""
+        if "gid=" in url:
+            match = re.search(r'gid=(\d+)', url)
+            if match:
+                return match.group(1)
+        return "0"
+
+    def _extract_urls_from_any_column(self, csv_content: str) -> List[str]:
+        """Fallback: extract URLs from any column in the CSV."""
+        urls = []
+        reader = csv.reader(io.StringIO(csv_content))
+        next(reader, None)  # Skip header
+
+        for row in reader:
+            for cell in row:
+                cell = cell.strip()
+                if cell.startswith('http://') or cell.startswith('https://'):
+                    urls.append(cell)
+                    break  # Take first URL per row
+
+        logger.info(f"Fallback extraction found {len(urls)} URLs")
+        return urls
+
+    def _fallback_to_llm_reader(self, google_drive_url: str, url_column: str) -> List[str]:
+        """Fall back to the LLM-based GoogleDriveReader."""
+        reader = GoogleDriveReader()
+        return reader.read_urls(google_drive_url, url_column)
+
+
+# =============================================================================
+# Google Sheets Uploader
+# =============================================================================
+
+
+class GoogleSheetsUploader:
+    """Uploads results to a new Google Sheet using CrewAI Enterprise integration."""
+
+    def __init__(self, llm_model: str = "anthropic/claude-sonnet-4-20250514"):
+        self.llm = LLM(model=llm_model, temperature=0.1)
+
+    def upload_results(self, df, source_spreadsheet_id: str = None) -> str:
+        """
+        Upload a DataFrame to a new Google Sheet.
+
+        Args:
+            df: pandas DataFrame with results
+            source_spreadsheet_id: Optional ID of source sheet for naming
+
+        Returns:
+            URL of the created Google Sheet
+        """
+        import pandas as pd
+
+        # Convert DataFrame to list of lists for the API
+        headers = df.columns.tolist()
+        rows = df.values.tolist()
+
+        # Prepare all data (headers + rows)
+        all_data = [headers] + rows
+
+        # Create the sheet first
+        sheet_title = f"Sustainability Results {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+
+        logger.info(f"Creating new Google Sheet: {sheet_title}")
+
+        # Step 1: Create a new spreadsheet
+        spreadsheet_id = self._create_spreadsheet(sheet_title)
+
+        if not spreadsheet_id:
+            raise RuntimeError("Failed to create new Google Sheet")
+
+        logger.info(f"Created spreadsheet with ID: {spreadsheet_id}")
+
+        # Step 2: Upload data in batches to avoid LLM token limits
+        batch_size = 50  # Upload 50 rows at a time
+        total_rows = len(all_data)
+
+        for i in range(0, total_rows, batch_size):
+            batch = all_data[i:i + batch_size]
+            start_row = i + 1  # 1-indexed for Sheets
+
+            # For first batch, include headers at row 1
+            if i == 0:
+                range_str = f"A1:Z{len(batch)}"
+            else:
+                range_str = f"A{start_row}:Z{start_row + len(batch) - 1}"
+
+            logger.info(f"Uploading rows {i + 1}-{min(i + batch_size, total_rows)} of {total_rows}")
+            self._update_sheet_values(spreadsheet_id, range_str, batch)
+
+        sheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+        logger.info(f"Successfully uploaded {len(rows)} results to: {sheet_url}")
+
+        return sheet_url
+
+    def _create_spreadsheet(self, title: str) -> Optional[str]:
+        """Create a new Google Spreadsheet and return its ID."""
+        agent = Agent(
+            role="Google Sheets Creator",
+            goal="Create a new Google Spreadsheet",
+            backstory="You create Google Spreadsheets.",
+            llm=self.llm,
+            tools=[],
+            apps=["google_sheets/create_spreadsheet"],
+            verbose=True,
+        )
 
         task = Task(
             description=f"""
-            Access the Excel file from Google Drive and extract all URLs.
+            Create a new Google Spreadsheet with the title: "{title}"
 
-            File identifier: {file_identifier}
+            Use google_sheets/create_spreadsheet with:
+            - title: "{title}"
 
-            Steps:
-            1. Find or access the file using the identifier (could be file ID, name, or path)
-            2. Download or read the Excel file content
-            3. Find the column named 'CLEAN_LEGACY_URL' (or similar URL column)
-            4. Extract ALL URLs from that column
-            5. Return the complete list of URLs
-
-            Make sure to get ALL URLs from the file, not just a sample.
+            Return ONLY the spreadsheet ID from the response (the 'spreadsheetId' field).
+            Do not include any other text, just the ID string.
             """,
-            expected_output="""
-            A complete list of all URLs found in the CLEAN_LEGACY_URL column.
-            Format as one URL per line, like:
-            https://example.com/page1
-            https://example.com/page2
-            https://example.com/page3
-            ...
-            """,
+            expected_output="The spreadsheet ID string only.",
             agent=agent,
         )
 
-        crew = Crew(
-            agents=[agent],
-            tasks=[task],
-            process=Process.sequential,
+        crew = Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=True)
+        result = crew.kickoff()
+
+        raw_output = str(result.raw) if hasattr(result, 'raw') else str(result)
+
+        # Extract spreadsheet ID from response
+        # Look for the ID pattern (alphanumeric with dashes/underscores)
+        id_patterns = [
+            r'"spreadsheetId"\s*:\s*"([^"]+)"',
+            r"'spreadsheetId'\s*:\s*'([^']+)'",
+            r'spreadsheetId["\']?\s*:\s*["\']?([a-zA-Z0-9_-]{20,})',
+            r'([a-zA-Z0-9_-]{30,50})',  # Fallback: look for long alphanumeric string
+        ]
+
+        for pattern in id_patterns:
+            match = re.search(pattern, raw_output)
+            if match:
+                return match.group(1)
+
+        logger.error(f"Could not extract spreadsheet ID from: {raw_output[:200]}")
+        return None
+
+    def _update_sheet_values(self, spreadsheet_id: str, range_str: str, values: List[List]) -> bool:
+        """Update values in a Google Sheet."""
+        # Convert values to JSON string for the prompt
+        values_json = json.dumps(values)
+
+        agent = Agent(
+            role="Google Sheets Writer",
+            goal="Write data to Google Sheets",
+            backstory="You write data to Google Spreadsheets accurately.",
+            llm=self.llm,
+            tools=[],
+            apps=["google_sheets/update_values"],
             verbose=True,
         )
 
+        task = Task(
+            description=f"""
+            Update values in Google Sheets.
+
+            Use google_sheets/update_values with:
+            - spreadsheet_id: "{spreadsheet_id}"
+            - range: "{range_str}"
+            - values: {values_json}
+            - valueInputOption: "RAW"
+
+            Confirm the update was successful.
+            """,
+            expected_output="Confirmation that values were updated.",
+            agent=agent,
+        )
+
+        crew = Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=True)
         result = crew.kickoff()
 
-        # Parse URLs from result
-        urls = []
-        raw_result = str(result)
-        for line in raw_result.split('\n'):
-            line = line.strip()
-            if line.startswith('http://') or line.startswith('https://'):
-                urls.append(line)
+        return True
+
+
+# =============================================================================
+# LLM-based Google Drive Reader (fallback for non-public sheets)
+# =============================================================================
+
+
+class GoogleDriveReader:
+    """Reads URLs from Google Drive using CrewAI Enterprise integration with pagination."""
+
+    ROWS_PER_PAGE = 30  # Fetch 30 rows at a time to prevent LLM truncation
+
+    def __init__(self, llm_model: str = "anthropic/claude-sonnet-4-20250514"):
+        self.llm = LLM(model=llm_model, temperature=0.1)
+
+    def read_urls(self, google_drive_url: str, url_column: str) -> List[str]:
+        """Extract URLs from a Google Drive spreadsheet using paginated reads."""
+        spreadsheet_id = self._extract_spreadsheet_id(google_drive_url)
+        all_urls = []
+        page = 0
+        max_pages = 200  # Safety limit: 200 pages * 30 rows = 6000 max rows
+        consecutive_empty_pages = 0
+        max_consecutive_empty = 2  # Stop after 2 consecutive empty pages
+
+        logger.info(f"Reading spreadsheet {spreadsheet_id} in pages of {self.ROWS_PER_PAGE} rows")
+
+        while page < max_pages:
+            start_row = (page * self.ROWS_PER_PAGE) + 1
+            end_row = start_row + self.ROWS_PER_PAGE - 1
+
+            # First page includes header, subsequent pages don't need it
+            if page == 0:
+                range_str = f"A1:Z{end_row}"
+            else:
+                range_str = f"A{start_row}:Z{end_row}"
+
+            logger.info(f"Fetching page {page + 1}: rows {start_row}-{end_row}")
+
+            urls_from_page = self._fetch_page(spreadsheet_id, range_str, url_column, include_header=(page == 0))
+
+            if not urls_from_page:
+                consecutive_empty_pages += 1
+                logger.info(f"No URLs found on page {page + 1} (consecutive empty: {consecutive_empty_pages})")
+                if consecutive_empty_pages >= max_consecutive_empty:
+                    logger.info(f"Stopping pagination after {max_consecutive_empty} consecutive empty pages")
+                    break
+            else:
+                consecutive_empty_pages = 0  # Reset counter when we find URLs
+                all_urls.extend(urls_from_page)
+                logger.info(f"Page {page + 1}: found {len(urls_from_page)} URLs (total: {len(all_urls)})")
+
+            page += 1
+
+        logger.info(f"Total URLs extracted: {len(all_urls)}")
+        return all_urls
+
+    def _detect_truncation(self, text: str) -> bool:
+        """Detect if the LLM truncated the response."""
+        truncation_patterns = [
+            r'\.\.\.\s*and\s+\d+\s+more',
+            r'\.\.\.\s*\d+\s+additional',
+            r'truncated',
+            r'remaining\s+\d+\s+rows',
+            r'continues\s+with',
+            r'\[\.\.\.]\s*$',
+            r'etc\.\s*$',
+            r'and\s+so\s+on',
+            r'\d+\s+more\s+rows',
+            r'omitted\s+for\s+brevity',
+        ]
+        for pattern in truncation_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                return True
+        return False
+
+    def _fetch_page(self, spreadsheet_id: str, range_str: str, url_column: str, include_header: bool, retry_count: int = 0) -> List[str]:
+        """Fetch a single page of data from the spreadsheet with retry logic."""
+        max_retries = 2
+
+        agent = Agent(
+            role="Google Sheets Data Extractor",
+            goal="Fetch ALL spreadsheet data and return EVERY row without any summarization",
+            backstory="You are a precise data extraction agent. You MUST return complete, unmodified API responses. NEVER truncate or summarize data.",
+            llm=self.llm,
+            tools=[],
+            apps=["google_sheets/get_values"],
+            verbose=True,
+        )
+
+        task = Task(
+            description=f"""
+            Fetch data from Google Sheets and return ALL rows.
+
+            Use google_sheets/get_values with:
+            - spreadsheet_id: "{spreadsheet_id}"
+            - range: "{range_str}"
+            - majorDimension: "ROWS"
+
+            CRITICAL INSTRUCTIONS:
+            1. Return the COMPLETE raw API response with ALL rows
+            2. Do NOT summarize, truncate, or skip any rows
+            3. Do NOT say "and X more rows" - include EVERY row
+            4. Do NOT use "..." or ellipsis - show all data
+            5. Output the full JSON response exactly as received
+            6. If there are 50 rows, you must show all 50 rows
+            """,
+            expected_output="Complete raw JSON response from Google Sheets API containing ALL rows of data. No truncation.",
+            agent=agent,
+        )
+
+        crew = Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=True)
+        result = crew.kickoff()
+
+        raw_output = str(result.raw) if hasattr(result, 'raw') else str(result)
+
+        # Check for truncation
+        if self._detect_truncation(raw_output) and retry_count < max_retries:
+            logger.warning(f"Detected truncated response for range {range_str}, retrying ({retry_count + 1}/{max_retries})")
+            return self._fetch_page(spreadsheet_id, range_str, url_column, include_header, retry_count + 1)
+
+        urls = self._parse_urls_from_api_response(raw_output, url_column, skip_header=not include_header)
+
+        # Log parsing details for debugging
+        logger.info(f"Range {range_str}: output {len(raw_output)} chars, parsed {len(urls)} URLs")
+
+        # Warn if we got suspiciously few URLs (likely truncation)
+        if len(urls) < 10 and "Z50" in range_str and retry_count == 0:
+            logger.warning(f"Low URL count ({len(urls)}) for range {range_str} - possible truncation")
 
         return urls
 
+    def _extract_spreadsheet_id(self, url: str) -> str:
+        """Extract spreadsheet ID from Google Sheets URL."""
+        if "/spreadsheets/d/" in url:
+            parts = url.split("/spreadsheets/d/")[1]
+            return parts.split("/")[0]
+        return url
 
-class SingleBatchCrew:
-    """A lightweight crew that processes URLs using a single agent for scrape+classify."""
+    def _parse_urls_from_api_response(self, text: str, url_column: str, skip_header: bool = False) -> List[str]:
+        """Parse URLs directly from Google Sheets API response JSON."""
+        urls = []
+        all_rows = []
+
+        # Method 1: Try to find and parse complete JSON structure
+        # Look for "values": followed by a nested array structure
+        try:
+            # Find the start of values array
+            values_start = text.find('"values"')
+            if values_start == -1:
+                values_start = text.find("'values'")
+
+            if values_start != -1:
+                # Find the opening bracket after "values":
+                bracket_start = text.find('[', values_start)
+                if bracket_start != -1:
+                    # Count brackets to find matching close
+                    depth = 0
+                    bracket_end = -1
+                    for i in range(bracket_start, len(text)):
+                        if text[i] == '[':
+                            depth += 1
+                        elif text[i] == ']':
+                            depth -= 1
+                            if depth == 0:
+                                bracket_end = i
+                                break
+
+                    if bracket_end != -1:
+                        array_str = text[bracket_start:bracket_end + 1]
+                        # Clean up for JSON parsing
+                        array_str = array_str.replace("'", '"')
+                        try:
+                            rows = json.loads(array_str)
+                            if isinstance(rows, list):
+                                all_rows.extend(rows)
+                                logger.debug(f"Method 1: Parsed {len(rows)} rows from JSON")
+                        except json.JSONDecodeError:
+                            pass
+        except Exception as e:
+            logger.debug(f"Method 1 failed: {e}")
+
+        # Method 2: Fallback - find individual row arrays
+        if not all_rows:
+            # Match rows like ["value1", "value2", ...]
+            row_pattern = r'\[([^\[\]]+)\]'
+            row_matches = re.findall(row_pattern, text)
+            for row_match in row_matches:
+                # Skip if it looks like it's not a data row
+                if 'http' not in row_match.lower() and url_column.lower() not in row_match.lower():
+                    continue
+                try:
+                    row = json.loads("[" + row_match + "]")
+                    if isinstance(row, list) and len(row) > 0:
+                        all_rows.append(row)
+                except json.JSONDecodeError:
+                    continue
+            if all_rows:
+                logger.debug(f"Method 2: Parsed {len(all_rows)} rows from individual arrays")
+
+        if all_rows:
+            # Find the column index for url_column (check first row for header)
+            url_col_idx = None
+            start_idx = 0
+
+            if all_rows and isinstance(all_rows[0], list):
+                header = all_rows[0]
+                for idx, col_name in enumerate(header):
+                    if str(col_name).strip().upper() == url_column.upper():
+                        url_col_idx = idx
+                        break
+
+                # If we found a header match, skip it unless told otherwise
+                if url_col_idx is not None and not skip_header:
+                    start_idx = 1
+                elif skip_header:
+                    start_idx = 0  # No header in this page
+
+            if url_col_idx is not None:
+                # Extract URLs from that column
+                for row in all_rows[start_idx:]:
+                    if isinstance(row, list) and len(row) > url_col_idx:
+                        cell = str(row[url_col_idx]).strip()
+                        if cell.startswith("http://") or cell.startswith("https://"):
+                            urls.append(cell)
+            else:
+                # Column not found by name, try to find URLs in any column
+                for row in all_rows[start_idx:]:
+                    if isinstance(row, list):
+                        for cell in row:
+                            cell_str = str(cell).strip()
+                            if cell_str.startswith("http://") or cell_str.startswith("https://"):
+                                urls.append(cell_str)
+
+        # Fallback: regex extraction if no structured data found
+        if not urls:
+            logger.info("No structured data found, falling back to regex extraction")
+            # More comprehensive URL pattern
+            url_patterns = [
+                r'https?://[^\s<>"\')\],}\\]+',
+                r'https?://[\w\-\.]+\.[a-zA-Z]{2,}[^\s<>"\')*\],}\\]*',
+            ]
+            seen_urls = set()
+            for url_pattern in url_patterns:
+                found_urls = re.findall(url_pattern, text)
+                for url in found_urls:
+                    url = url.rstrip('.,;:')
+                    # Clean up common trailing artifacts
+                    url = re.sub(r'["\'\]\}\)]+$', '', url)
+                    if url and url not in seen_urls:
+                        seen_urls.add(url)
+                        urls.append(url)
+            logger.info(f"Regex found {len(urls)} URLs")
+
+        # Log summary
+        logger.info(f"Total URLs parsed from response: {len(urls)}")
+        return urls
+
+
+# =============================================================================
+# URL Processor
+# =============================================================================
+
+
+class URLProcessor:
+    """Processes individual URLs for sustainability classification."""
 
     def __init__(self, llm_model: str = "anthropic/claude-sonnet-4-20250514"):
-        self.llm = LLM(model=llm_model, temperature=0.7)
+        self.llm_model = llm_model
         self.scraper_tool = FirecrawlScrapeWebsiteTool()
 
-    def _create_scrape_and_classify_agent(self) -> Agent:
-        """Single agent that scrapes and classifies in one flow."""
-        return Agent(
+    def _create_crew(self, url: str) -> Crew:
+        """Create a crew for processing a single URL."""
+        llm = LLM(model=self.llm_model, temperature=0.7)
+
+        agent = Agent(
             role="Sustainability Marketing Analyst",
-            goal="Scrape website content and classify whether sustainability is used as a marketing message",
-            backstory="""You are an expert marketing analyst who specializes in web research
-            and sustainability messaging classification. You scrape websites to extract their
-            marketing content, then analyze whether they use sustainability/environmental
-            benefits as a competitive differentiator. You are thorough but conservative -
-            only marking content as sustainability marketing when it's explicitly used as
-            a selling point, not just incidental mentions.""",
+            goal="Scrape and classify URL for sustainability marketing",
+            backstory=(
+                "Expert marketing analyst specializing in sustainability messaging. "
+                "Identifies when companies use environmental benefits as competitive differentiators."
+            ),
             tools=[self.scraper_tool],
-            llm=self.llm,
-            allow_delegation=False,
-            max_iter=25,
+            llm=llm,
             verbose=True,
         )
-
-    def process_batch(self, urls: list[str], batch_number: int) -> list[dict]:
-        """Process a batch of URLs - scrape and classify each one."""
-
-        agent = self._create_scrape_and_classify_agent()
-
-        # Build the URL list for the task
-        url_list = chr(10).join(f'{i+1}. {url}' for i, url in enumerate(urls))
 
         task = Task(
             description=f"""
-            Process these {len(urls)} URLs from Batch {batch_number}. For EACH URL:
+            Analyze this URL for sustainability marketing:
 
-            STEP 1 - SCRAPE: Use your scraping tool to fetch the page content
-            STEP 2 - CLASSIFY: Based on the scraped content, determine if sustainability is used as marketing
+            URL: {url}
 
-            URLs to process:
-            {url_list}
+            1. Scrape the page content
+            2. Classify whether sustainability is used as a marketing message
 
-            For each URL, after scraping, classify:
+            Classification criteria:
+            - YES: Sustainability/environmental benefits explicitly used as marketing differentiator
+            - NO: Sustainability absent, incidental, or purely technical
 
-            - sustainability_marketing: "YES" if sustainability/environmental benefits are explicitly
-              used as a MARKETING MESSAGE or competitive differentiator. "NO" otherwise.
+            If YES, assign percentage (10-20% minor, 25-40% clear, 50-70% primary, 80-100% core).
 
-            - sustainability_percentage:
-              * 0 if NO
-              * 10-20% if minor mention
-              * 25-40% if clear but not dominant
-              * 50-70% if primary value proposition
-              * 80-100% if core marketing message
+            Themes: Energy Efficiency; Carbon/Embodied Carbon; Green Certifications;
+            Environmental Analysis Tools; Climate Resilience; Material Sustainability;
+            Operational Emissions; Waste Reduction; Renewables/Clean Energy
 
-            - confidence: 0.0-1.0 how confident you are
-
-            - themes (if YES, pick from): Energy Efficiency; Carbon / Embodied Carbon;
-              Green Certifications; Environmental Analysis Tools; Climate Resilience;
-              Material Sustainability; Operational Emissions; Waste Reduction; Renewables / Clean Energy
-
-            - reason: 1-2 sentences citing SPECIFIC EVIDENCE from the page content you scraped.
-              Example: "The page prominently displays 'Reduce your carbon footprint by 40%' as a headline
-              and lists LEED certification as a key product benefit."
-
-            IMPORTANT:
-            - You MUST scrape each URL before classifying it
-            - Base classifications on ACTUAL SCRAPED CONTENT, not assumptions
-            - Be conservative - only "YES" for explicit sustainability marketing
-            - Return ALL {len(urls)} classifications
+            Provide 1-2 sentence reason citing specific evidence from the page.
             """,
             expected_output=f"""
-            Return exactly {len(urls)} classifications as a JSON array. Each object must have:
-            - url: the exact URL
-            - sustainability_marketing: "YES" or "NO"
-            - sustainability_percentage: integer 0-100
-            - confidence: float 0.0-1.0
-            - themes: string (comma-separated themes or empty)
-            - reason: string (1-2 sentences with specific evidence)
-
-            Format:
-            [
-              {{"url": "...", "sustainability_marketing": "YES", "sustainability_percentage": 45, "confidence": 0.85, "themes": "Energy Efficiency", "reason": "Page headline states 'Save 30% on energy costs' and promotes green building certification."}},
-              {{"url": "...", "sustainability_marketing": "NO", "sustainability_percentage": 0, "confidence": 0.9, "themes": "", "reason": "Page focuses on pricing and features with no environmental messaging."}}
-            ]
+            JSON object:
+            {{"url": "{url}", "sustainability_marketing": "YES/NO", "sustainability_percentage": 0-100,
+            "confidence": 0.0-1.0, "themes": "...", "reason": "..."}}
             """,
             agent=agent,
-            output_pydantic=BatchClassificationResult,
+            output_pydantic=URLClassification,
         )
 
-        crew = Crew(
-            agents=[agent],
-            tasks=[task],
-            process=Process.sequential,
-            verbose=True,
-        )
+        return Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=True)
 
-        result = crew.kickoff()
-        return self._parse_batch_results(urls, result)
-
-    def _parse_batch_results(self, urls: list[str], crew_result) -> list[dict]:
-        """Parse classification results for the batch."""
-        results = []
-        parsed_by_url = {}
-
-        # Try pydantic output first
+    async def process_async(self, url: str) -> dict:
+        """Process a single URL asynchronously."""
         try:
-            if hasattr(crew_result, 'pydantic') and crew_result.pydantic:
-                batch_result = crew_result.pydantic
-                if hasattr(batch_result, 'classifications'):
-                    for c in batch_result.classifications:
-                        url_key = c.url.lower().strip().rstrip('/')
-                        parsed_by_url[url_key] = {
-                            "url": c.url,
-                            "sustainability_marketing": c.sustainability_marketing.upper(),
-                            "sustainability_percentage": c.sustainability_percentage,
-                            "confidence": c.confidence,
-                            "themes": c.themes,
-                            "reason": c.reason
-                        }
-                    print(f"  ✓ Parsed {len(parsed_by_url)} from structured output")
+            crew = self._create_crew(url)
+            result = await crew.kickoff_async()
+            return self._parse_result(url, result)
         except Exception as e:
-            print(f"  Note: Pydantic parse issue: {e}")
+            logger.warning(f"Failed to process {url}: {e}")
+            return self._default_result(url, str(e))
 
-        # Try JSON extraction if pydantic failed
-        if not parsed_by_url:
-            raw_result = str(crew_result)
-            try:
-                json_match = re.search(r'\[[\s\S]*\]', raw_result)
-                if json_match:
-                    data = json.loads(json_match.group(0))
-                    for item in data:
-                        if isinstance(item, dict) and 'url' in item:
-                            url_key = item['url'].lower().strip().rstrip('/')
-                            parsed_by_url[url_key] = {
-                                "url": item.get('url', ''),
-                                "sustainability_marketing": str(item.get('sustainability_marketing', 'NO')).upper(),
-                                "sustainability_percentage": int(item.get('sustainability_percentage', 0)),
-                                "confidence": float(item.get('confidence', 0.5)),
-                                "themes": str(item.get('themes', '')),
-                                "reason": str(item.get('reason', ''))
-                            }
-                    print(f"  ✓ Parsed {len(parsed_by_url)} from JSON")
-            except Exception as e:
-                print(f"  Note: JSON parse issue: {e}")
+    def _parse_result(self, url: str, crew_result) -> dict:
+        """Parse crew result into dictionary."""
+        try:
+            if hasattr(crew_result, "pydantic") and crew_result.pydantic:
+                c = crew_result.pydantic
+                return {
+                    "url": url,
+                    "sustainability_marketing": c.sustainability_marketing.upper(),
+                    "sustainability_percentage": c.sustainability_percentage,
+                    "confidence": c.confidence,
+                    "themes": c.themes,
+                    "reason": c.reason,
+                }
+        except Exception:
+            pass
 
-        # Match results to original URLs
-        for url in urls:
-            url_key = url.lower().strip().rstrip('/')
+        # Fallback: try JSON extraction
+        raw = str(crew_result)
+        try:
+            match = re.search(r"\{[^{}]*\"url\"[^{}]*\}", raw, re.DOTALL)
+            if match:
+                data = json.loads(match.group(0))
+                return {
+                    "url": url,
+                    "sustainability_marketing": str(data.get("sustainability_marketing", "NO")).upper(),
+                    "sustainability_percentage": int(data.get("sustainability_percentage", 0)),
+                    "confidence": float(data.get("confidence", 0.5)),
+                    "themes": str(data.get("themes", "")),
+                    "reason": str(data.get("reason", "")),
+                }
+        except Exception:
+            pass
 
-            if url_key in parsed_by_url:
-                results.append(parsed_by_url[url_key])
-            else:
-                # Try partial match
-                matched = False
-                for key, value in parsed_by_url.items():
-                    if url_key in key or key in url_key:
-                        value['url'] = url
-                        results.append(value)
-                        matched = True
-                        break
+        return self._default_result(url, "Could not parse result")
 
-                if not matched:
-                    results.append({
-                        "url": url,
-                        "sustainability_marketing": "NO",
-                        "sustainability_percentage": 0,
-                        "confidence": 0.3,
-                        "themes": "",
-                        "reason": "Could not parse classification from output"
-                    })
-
-        return results
+    def _default_result(self, url: str, reason: str) -> dict:
+        """Return default classification result."""
+        return {
+            "url": url,
+            "sustainability_marketing": "NO",
+            "sustainability_percentage": 0,
+            "confidence": 0.3,
+            "themes": "",
+            "reason": reason[:200],
+        }
 
 
+# =============================================================================
+# Parallel Batch Processor
+# =============================================================================
 
-# ============================================================================
-# Main Batch Processing Flow
-# ============================================================================
 
-def is_google_drive_reference(path: str) -> bool:
-    """Check if a path is a Google Drive URL or file ID."""
-    if path.startswith('http://') or path.startswith('https://'):
-        return 'drive.google.com' in path or 'docs.google.com' in path
-    # Could also be a file ID (long alphanumeric string)
-    return len(path) > 20 and path.replace('-', '').replace('_', '').isalnum()
+class ParallelBatchProcessor:
+    """Processes URLs in parallel with concurrency control."""
+
+    def __init__(self, llm_model: str = "anthropic/claude-sonnet-4-20250514", max_concurrent: int = 5):
+        self.processor = URLProcessor(llm_model=llm_model)
+        self.max_concurrent = max_concurrent
+
+    async def process_batch(self, urls: List[str]) -> List[dict]:
+        """Process a batch of URLs in parallel."""
+        semaphore = asyncio.Semaphore(self.max_concurrent)
+
+        async def process_with_limit(url: str) -> dict:
+            async with semaphore:
+                return await self.processor.process_async(url)
+
+        tasks = [process_with_limit(url) for url in urls]
+        return await asyncio.gather(*tasks)
+
+    def process_batch_sync(self, urls: List[str]) -> List[dict]:
+        """Synchronous wrapper for batch processing."""
+        return asyncio.run(self.process_batch(urls))
+
+
+# =============================================================================
+# Main Flow
+# =============================================================================
 
 
 class SustainabilityBatchFlow(Flow[BatchState]):
     """
-    CrewAI Flow for processing sustainability classifications in batches.
+    Flow for processing sustainability classifications in parallel batches.
 
-    This flow:
-    1. Downloads file from Google Drive (if URL provided) or uses local file
-    2. Loads URLs from the Excel file
-    3. Divides them into configurable batches
-    4. Processes each batch with a dedicated crew
-    5. Accumulates results and saves to CSV
+    Steps:
+    1. Load URLs from Google Drive
+    2. Process in parallel batches
+    3. Save results to CSV
     """
 
     def __init__(self, llm_model: str = "anthropic/claude-sonnet-4-20250514"):
         super().__init__()
         self.llm_model = llm_model
-        self.temp_dir = None
 
     @start()
-    def load_excel_data(self) -> BatchState:
-        """Load URLs from Excel - either local file or Google Drive."""
-        print(f"\n{'='*60}")
-        print("STEP 1: Loading Excel Data")
-        print(f"{'='*60}")
+    def load_data(self) -> BatchState:
+        """Load URLs from Google Drive using direct CSV export (preferred) or LLM fallback."""
+        logger.info(f"Loading data from Google Drive: {self.state.google_drive_url[:60]}...")
+        logger.info(f"Looking for column: {self.state.url_column}")
 
         state = self.state
 
         try:
-            # Check if file_path is a Google Drive reference
-            if is_google_drive_reference(state.file_path):
-                print(f"📁 Detected Google Drive reference, using Enterprise integration...")
-                state.is_remote = True
+            # Use direct CSV reader first (faster, no truncation issues)
+            reader = DirectGoogleSheetsReader()
+            urls = reader.read_urls(state.google_drive_url, state.url_column)
 
-                # Use CrewAI Enterprise Google Drive integration
-                drive_reader = GoogleDriveReader(llm_model=self.llm_model)
-                urls = drive_reader.read_urls_from_drive(state.file_path)
-
-                if urls:
-                    state.all_urls = urls
-                    state.total_urls = len(urls)
-                    state.total_batches = (len(urls) + state.batch_size - 1) // state.batch_size
-                    state.current_batch_index = 0
-
-                    print(f"✓ Loaded {state.total_urls} URLs from Google Drive")
-                    print(f"✓ Will process in {state.total_batches} batches of {state.batch_size} URLs each")
-                    return state
-                else:
-                    state.error_message = "No URLs extracted from Google Drive file"
-                    print(f"ERROR: {state.error_message}")
-                    return state
-
-            # Local file processing
-            print(f"Using local file: {state.file_path}")
-            excel_path = state.file_path
-
-            # Read the Excel file
-            df = pd.read_excel(excel_path)
-
-            # Find the URL column (try common names)
-            url_column = None
-            possible_columns = ['CLEAN_LEGACY_URL', 'URL', 'url', 'Website', 'website', 'Link', 'link']
-
-            for col in possible_columns:
-                if col in df.columns:
-                    url_column = col
-                    break
-
-            if url_column is None:
-                # Try to find any column with 'url' in name
-                for col in df.columns:
-                    if 'url' in col.lower():
-                        url_column = col
-                        break
-
-            if url_column is None:
-                state.error_message = f"Could not find URL column. Available columns: {list(df.columns)}"
-                print(f"ERROR: {state.error_message}")
+            if not urls:
+                state.error_message = f"No URLs found in column '{state.url_column}'"
+                logger.error(state.error_message)
                 return state
-
-            # Extract URLs, filter out empty/invalid entries
-            urls = df[url_column].dropna().astype(str).tolist()
-            urls = [url.strip() for url in urls if url.strip() and url.strip().lower() != 'nan']
 
             state.all_urls = urls
             state.total_urls = len(urls)
             state.total_batches = (len(urls) + state.batch_size - 1) // state.batch_size
-            state.current_batch_index = 0
 
-            print(f"✓ Loaded {state.total_urls} URLs from column '{url_column}'")
-            print(f"✓ Will process in {state.total_batches} batches of {state.batch_size} URLs each")
+            logger.info(f"Successfully loaded {state.total_urls} URLs")
+            logger.info(f"Will process in {state.total_batches} batches of {state.batch_size}")
 
-        except FileNotFoundError:
-            state.error_message = f"File not found: {state.file_path}"
-            print(f"ERROR: {state.error_message}")
         except Exception as e:
-            state.error_message = f"Error loading Excel file: {str(e)}"
-            print(f"ERROR: {state.error_message}")
+            state.error_message = f"Failed to load data: {e}"
+            logger.error(state.error_message, exc_info=True)
 
         return state
 
-    @listen(load_excel_data)
+    @listen(load_data)
     def process_batches(self) -> BatchState:
-        """Process all batches sequentially."""
-        print(f"\n{'='*60}")
-        print("STEP 2: Processing Batches")
-        print(f"{'='*60}")
-
+        """Process all batches with parallel URL execution."""
         state = self.state
 
-        if state.error_message:
-            print(f"Skipping batch processing due to error: {state.error_message}")
+        if state.error_message or not state.all_urls:
             return state
 
-        if state.total_urls == 0:
-            state.error_message = "No URLs to process"
-            print("ERROR: No URLs found in the file")
-            return state
+        logger.info(f"Processing {state.total_urls} URLs in {state.total_batches} batches...")
 
-        # Initialize the batch crew
-        batch_crew = SingleBatchCrew(llm_model=self.llm_model)
+        processor = ParallelBatchProcessor(
+            llm_model=self.llm_model,
+            max_concurrent=state.max_concurrent,
+        )
 
-        # Process each batch
         for batch_idx in range(state.total_batches):
-            state.current_batch_index = batch_idx
-
-            # Calculate batch boundaries
             start_idx = batch_idx * state.batch_size
             end_idx = min(start_idx + state.batch_size, state.total_urls)
             batch_urls = state.all_urls[start_idx:end_idx]
 
-            print(f"\n--- Processing Batch {batch_idx + 1}/{state.total_batches} ---")
-            print(f"URLs {start_idx + 1} to {end_idx} ({len(batch_urls)} URLs)")
+            logger.info(f"Batch {batch_idx + 1}/{state.total_batches}: {len(batch_urls)} URLs")
 
             try:
-                # Process this batch
-                batch_results = batch_crew.process_batch(batch_urls, batch_idx + 1)
-
-                # Accumulate results
-                state.all_results.extend(batch_results)
-                state.processed_count += len(batch_results)
-
-                print(f"✓ Batch {batch_idx + 1} complete: {len(batch_results)} URLs processed")
-                print(f"✓ Total progress: {state.processed_count}/{state.total_urls} URLs")
-
+                results = processor.process_batch_sync(batch_urls)
+                state.all_results.extend(results)
+                state.processed_count += len(results)
             except Exception as e:
-                print(f"✗ Error processing batch {batch_idx + 1}: {str(e)}")
-                # Add failed URLs to tracking
+                logger.error(f"Batch {batch_idx + 1} failed: {e}")
                 state.failed_urls.extend(batch_urls)
-                # Continue with next batch
-                continue
 
         return state
 
     @listen(process_batches)
     def save_results(self) -> BatchState:
-        """Save all accumulated results to a CSV file."""
-        print(f"\n{'='*60}")
-        print("STEP 3: Saving Results")
-        print(f"{'='*60}")
-
+        """Save results to a new Google Sheet and clean up local files."""
         state = self.state
 
-        if state.error_message and not state.all_results:
-            print(f"Cannot save results due to error: {state.error_message}")
-            return state
-
         if not state.all_results:
-            print("No results to save")
-            state.error_message = "No results were generated"
+            state.error_message = "No results to save"
             return state
 
         try:
-            # Create DataFrame from results
-            results_df = pd.DataFrame(state.all_results)
+            import pandas as pd
 
-            # Ensure proper column order
-            column_order = ['url', 'sustainability_marketing', 'sustainability_percentage',
-                          'confidence', 'themes', 'reason']
+            df = pd.DataFrame(state.all_results)
 
-            # Add any missing columns with defaults
-            for col in column_order:
-                if col not in results_df.columns:
-                    results_df[col] = ""
+            columns = [
+                "url",
+                "sustainability_marketing",
+                "sustainability_percentage",
+                "confidence",
+                "themes",
+                "reason",
+            ]
+            for col in columns:
+                if col not in df.columns:
+                    df[col] = ""
+            df = df[columns]
 
-            results_df = results_df[column_order]
+            # Extract source spreadsheet ID for reference
+            source_id = None
+            if state.google_drive_url and "/spreadsheets/d/" in state.google_drive_url:
+                parts = state.google_drive_url.split("/spreadsheets/d/")[1]
+                source_id = parts.split("/")[0].split("?")[0]
 
-            # Determine output filename
-            if state.output_filename:
-                output_path = state.output_filename
-            else:
-                timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-                output_path = f"sustainability_classification_results_{timestamp}.csv"
+            # Upload to new Google Sheet
+            logger.info("Uploading results to new Google Sheet...")
+            uploader = GoogleSheetsUploader(llm_model=self.llm_model)
+            sheet_url = uploader.upload_results(df, source_spreadsheet_id=source_id)
 
-            # Save to CSV
-            results_df.to_csv(output_path, index=False)
-
-            print(f"✓ Results saved to: {output_path}")
-            print(f"✓ Total URLs processed: {len(state.all_results)}/{state.total_urls}")
-
-            if state.failed_urls:
-                print(f"✗ Failed URLs: {len(state.failed_urls)}")
-                failed_path = output_path.replace('.csv', '_failed.txt')
-                with open(failed_path, 'w') as f:
-                    f.write('\n'.join(state.failed_urls))
-                print(f"✓ Failed URLs saved to: {failed_path}")
-
+            state.output_filename = sheet_url
             state.is_complete = True
+            logger.info(f"Results uploaded to: {sheet_url}")
+
+            # Also save a temporary local copy, then delete it
+            temp_path = self._generate_filename()
+            df.to_csv(temp_path, index=False)
+            logger.info(f"Temporary local file created: {temp_path}")
+
+            # Delete local file
+            try:
+                import os
+                os.remove(temp_path)
+                logger.info(f"Deleted local file: {temp_path}")
+            except Exception as del_err:
+                logger.warning(f"Could not delete local file {temp_path}: {del_err}")
 
         except Exception as e:
-            state.error_message = f"Error saving results: {str(e)}"
-            print(f"ERROR: {state.error_message}")
+            state.error_message = f"Failed to save results: {e}"
+            logger.error(state.error_message, exc_info=True)
+
+            # Fallback: save locally if upload fails
+            try:
+                import pandas as pd
+                df = pd.DataFrame(state.all_results)
+                output_path = self._generate_filename()
+                df.to_csv(output_path, index=False)
+                logger.warning(f"Upload failed, saved locally to: {output_path}")
+                state.output_filename = output_path
+            except Exception:
+                pass
 
         return state
 
-    @listen(save_results)
-    def finalize(self) -> BatchState:
-        """Print final summary and return state."""
-        print(f"\n{'='*60}")
-        print("BATCH PROCESSING COMPLETE")
-        print(f"{'='*60}")
-
-        state = self.state
-
-        print(f"""
-Summary:
---------
-- Total URLs in file: {state.total_urls}
-- URLs processed successfully: {state.processed_count}
-- URLs failed: {len(state.failed_urls)}
-- Batches processed: {state.total_batches}
-- Batch size: {state.batch_size}
-- Status: {'SUCCESS' if state.is_complete else 'COMPLETED WITH ERRORS'}
-""")
-
-        if state.error_message:
-            print(f"Errors encountered: {state.error_message}")
-
-        return state
+    def _generate_filename(self) -> str:
+        """Generate timestamped output filename."""
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        return f"sustainability_results_{timestamp}.csv"
 
 
-# ============================================================================
-# Entry Points
-# ============================================================================
+# =============================================================================
+# Public API
+# =============================================================================
+
 
 def run_batch_flow(
-    file_path: str,
+    google_drive_url: str,
+    url_column: str,
     output_filename: Optional[str] = None,
-    batch_size: int = 10,
-    llm_model: str = "anthropic/claude-sonnet-4-20250514"
+    batch_size: int = 5,
+    max_concurrent: int = 5,
+    llm_model: str = "anthropic/claude-sonnet-4-20250514",
 ) -> BatchState:
     """
-    Run the batch processing flow.
+    Run the sustainability classification flow.
 
     Args:
-        file_path: Path to the Excel file containing URLs
-        output_filename: Output CSV filename (optional, auto-generated if not provided)
-        batch_size: Number of URLs to process per batch (default: 10)
-        llm_model: LLM model to use for processing (default: gpt-4o)
+        google_drive_url: Google Drive URL to the spreadsheet
+        url_column: Column name containing URLs
+        output_filename: Output CSV filename (auto-generated if not provided)
+        batch_size: URLs per batch
+        max_concurrent: Max concurrent URL processing
+        llm_model: LLM model to use
 
     Returns:
-        BatchState with processing results and status
+        BatchState with results
     """
-    # Initialize the flow with starting state
+    if not google_drive_url:
+        raise ValueError("google_drive_url is required")
+    if not url_column:
+        raise ValueError("url_column is required")
+
     initial_state = BatchState(
-        file_path=file_path,
+        google_drive_url=google_drive_url,
+        url_column=url_column,
         output_filename=output_filename or "",
         batch_size=batch_size,
+        max_concurrent=max_concurrent,
     )
 
-    # Create and run the flow
     flow = SustainabilityBatchFlow(llm_model=llm_model)
-
-    # Kickoff returns the final state
-    final_state = flow.kickoff(inputs=initial_state.model_dump())
-
-    return final_state
-
-
-def main():
-    """Main entry point for batch processing."""
-    import sys
-
-    # Default values
-    file_path = "Classifier Test File 1-2.xlsx"
-    output_filename = None
-    batch_size = 10
-
-    # Parse command line arguments
-    if len(sys.argv) > 1:
-        file_path = sys.argv[1]
-    if len(sys.argv) > 2:
-        output_filename = sys.argv[2]
-    if len(sys.argv) > 3:
-        batch_size = int(sys.argv[3])
-
-    print(f"""
-╔══════════════════════════════════════════════════════════════╗
-║     Sustainability Classifier - Batch Processing Flow        ║
-╚══════════════════════════════════════════════════════════════╝
-
-Configuration:
-- Input file: {file_path}
-- Output file: {output_filename or 'auto-generated'}
-- Batch size: {batch_size}
-""")
-
-    result = run_batch_flow(
-        file_path=file_path,
-        output_filename=output_filename,
-        batch_size=batch_size,
-    )
-
-    if result.is_complete:
-        print("\n✓ Batch processing completed successfully!")
-        return 0
-    else:
-        print(f"\n✗ Batch processing completed with errors: {result.error_message}")
-        return 1
-
-
-if __name__ == "__main__":
-    exit(main())
+    return flow.kickoff(inputs=initial_state.model_dump())
