@@ -33,7 +33,7 @@ warnings.filterwarnings("ignore", module="crewai.*")
 # Suppress noisy loggers before they initialize
 for logger_name in [
     "crewai", "crewai.telemetry", "crewai.utilities", "crewai.flow",
-    "litellm", "anthropic", "httpx", "opentelemetry", "urllib3"
+    "litellm", "openai", "httpx", "opentelemetry", "urllib3"
 ]:
     logging.getLogger(logger_name).setLevel(logging.CRITICAL)
 
@@ -44,7 +44,7 @@ class _SuppressCrewAINoise(logging.Filter):
         msg = record.getMessage()
         suppress = [
             "Event pairing mismatch", "CrewAIEventsBus", "API usage",
-            "input_tokens", "output_tokens", "total_tokens", "Anthropic API"
+            "input_tokens", "output_tokens", "total_tokens", "OpenAI API"
         ]
         return not any(s in msg for s in suppress)
 

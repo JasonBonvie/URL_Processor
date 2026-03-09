@@ -37,7 +37,7 @@ logging.getLogger("crewai").setLevel(logging.WARNING)
 logging.getLogger("crewai.telemetry").setLevel(logging.CRITICAL)
 logging.getLogger("crewai.utilities").setLevel(logging.CRITICAL)
 logging.getLogger("litellm").setLevel(logging.WARNING)
-logging.getLogger("anthropic").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("opentelemetry").setLevel(logging.CRITICAL)
 
@@ -52,7 +52,7 @@ class CrewAIOutputFilter(logging.Filter):
         "input_tokens",
         "output_tokens",
         "total_tokens",
-        "Anthropic API usage",
+        "OpenAI API usage",
     ]
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -259,7 +259,7 @@ class DirectGoogleSheetsReader:
 class GoogleSheetsUploader:
     """Uploads results to a new Google Sheet using CrewAI Enterprise integration."""
 
-    def __init__(self, llm_model: str = "anthropic/claude-sonnet-4-20250514"):
+    def __init__(self, llm_model: str = "openai/gpt-4o"):
         self.llm = LLM(model=llm_model, temperature=0.1)
 
     def upload_results(self, df, source_spreadsheet_id: str = None) -> str:
@@ -412,7 +412,7 @@ class GoogleDriveReader:
 
     ROWS_PER_PAGE = 30  # Fetch 30 rows at a time to prevent LLM truncation
 
-    def __init__(self, llm_model: str = "anthropic/claude-sonnet-4-20250514"):
+    def __init__(self, llm_model: str = "openai/gpt-4o"):
         self.llm = LLM(model=llm_model, temperature=0.1)
 
     def read_urls(self, google_drive_url: str, url_column: str) -> List[str]:
@@ -666,7 +666,7 @@ class GoogleDriveReader:
 class URLProcessor:
     """Processes individual URLs for sustainability classification."""
 
-    def __init__(self, llm_model: str = "anthropic/claude-sonnet-4-20250514"):
+    def __init__(self, llm_model: str = "openai/gpt-4o"):
         self.llm_model = llm_model
         self.scraper_tool = FirecrawlScrapeWebsiteTool()
 
@@ -783,7 +783,7 @@ class URLProcessor:
 class ParallelBatchProcessor:
     """Processes URLs in parallel with concurrency control."""
 
-    def __init__(self, llm_model: str = "anthropic/claude-sonnet-4-20250514", max_concurrent: int = 5):
+    def __init__(self, llm_model: str = "openai/gpt-4o", max_concurrent: int = 5):
         self.processor = URLProcessor(llm_model=llm_model)
         self.max_concurrent = max_concurrent
 
@@ -818,7 +818,7 @@ class SustainabilityBatchFlow(Flow[BatchState]):
     3. Save results to CSV
     """
 
-    def __init__(self, llm_model: str = "anthropic/claude-sonnet-4-20250514"):
+    def __init__(self, llm_model: str = "openai/gpt-4o"):
         super().__init__()
         self.llm_model = llm_model
 
@@ -974,7 +974,7 @@ def run_batch_flow(
     output_filename: Optional[str] = None,
     batch_size: int = 5,
     max_concurrent: int = 5,
-    llm_model: str = "anthropic/claude-sonnet-4-20250514",
+    llm_model: str = "openai/gpt-4o",
 ) -> BatchState:
     """
     Run the sustainability classification flow.

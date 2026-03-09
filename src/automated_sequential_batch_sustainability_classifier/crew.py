@@ -32,7 +32,7 @@ class AutomatedSequentialBatchSustainabilityClassifierCrew:
 
             max_execution_time=None,
             llm=LLM(
-                model="anthropic/claude-sonnet-4-20250514",
+                model="openai/gpt-4o",
                 temperature=0.7,
             ),
 
@@ -56,7 +56,7 @@ class AutomatedSequentialBatchSustainabilityClassifierCrew:
 
             max_execution_time=None,
             llm=LLM(
-                model="anthropic/claude-sonnet-4-20250514",
+                model="openai/gpt-4o",
                 temperature=0.7,
             ),
 
@@ -102,7 +102,7 @@ class AutomatedSequentialBatchSustainabilityClassifierCrew:
 
             max_execution_time=None,
             llm=LLM(
-                model="anthropic/claude-sonnet-4-20250514",
+                model="openai/gpt-4o",
                 temperature=0.7,
             ),
 
@@ -126,7 +126,7 @@ class AutomatedSequentialBatchSustainabilityClassifierCrew:
 
             max_execution_time=None,
             llm=LLM(
-                model="anthropic/claude-sonnet-4-20250514",
+                model="openai/gpt-4o",
                 temperature=0.7,
             ),
 
@@ -188,5 +188,5 @@ class AutomatedSequentialBatchSustainabilityClassifierCrew:
             tasks=self.tasks,  # Automatically created by the @task decorator
             process=Process.sequential,
             verbose=True,
-            chat_llm=LLM(model="anthropic/claude-sonnet-4-20250514"),
+            chat_llm=LLM(model="openai/gpt-4o"),
         )
