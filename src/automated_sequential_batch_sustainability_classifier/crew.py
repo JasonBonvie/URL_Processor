@@ -32,7 +32,7 @@ class AutomatedSequentialBatchSustainabilityClassifierCrew:
 
             max_execution_time=None,
             llm=LLM(
-                model="openai/gpt-4o",
+                model="openai/gpt-5.2",
                 temperature=0.7,
             ),
 
@@ -56,7 +56,7 @@ class AutomatedSequentialBatchSustainabilityClassifierCrew:
 
             max_execution_time=None,
             llm=LLM(
-                model="openai/gpt-4o",
+                model="openai/gpt-5.2",
                 temperature=0.7,
             ),
 
@@ -102,7 +102,7 @@ class AutomatedSequentialBatchSustainabilityClassifierCrew:
 
             max_execution_time=None,
             llm=LLM(
-                model="openai/gpt-4o",
+                model="openai/gpt-5.2",
                 temperature=0.7,
             ),
 
@@ -126,7 +126,7 @@ class AutomatedSequentialBatchSustainabilityClassifierCrew:
 
             max_execution_time=None,
             llm=LLM(
-                model="openai/gpt-4o",
+                model="openai/gpt-5.2",
                 temperature=0.7,
             ),
 
@@ -188,5 +188,5 @@ class AutomatedSequentialBatchSustainabilityClassifierCrew:
             tasks=self.tasks,  # Automatically created by the @task decorator
             process=Process.sequential,
             verbose=True,
-            chat_llm=LLM(model="openai/gpt-4o"),
+            chat_llm=LLM(model="openai/gpt-5.2"),
         )
